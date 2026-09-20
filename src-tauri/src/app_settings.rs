@@ -537,6 +537,8 @@ pub struct AppSettings {
     #[serde(default)]
     pub always_decode_raw_thumbnails: Option<bool>,
     #[serde(default)]
+    pub denoise_export_format: Option<String>,
+    #[serde(default)]
     pub workspace: WorkspaceState,
 }
 
@@ -632,6 +634,7 @@ impl Default for AppSettings {
             group_associated_files: Some(false),
             group_preferred_type: Some("raw".to_string()),
             always_decode_raw_thumbnails: Some(false),
+            denoise_export_format: Some("tiff".to_string()),
             workspace: WorkspaceState::default(),
         }
     }

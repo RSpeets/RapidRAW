@@ -8,6 +8,7 @@ use base64::{Engine as _, engine::general_purpose};
 use image::{DynamicImage, GenericImageView, ImageFormat, Rgb, Rgb32FImage};
 use rayon::{prelude::*};
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fs;
 use std::io::Cursor;
 use std::path::Path;
@@ -15,11 +16,47 @@ use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter};
 
+// Helper function to save 16-bit RGB image as proper DNG file
+fn save_denoised_as_dng(
+    image: &image::ImageBuffer<Rgb<u16>, Vec<u16>>,
+    path: &Path,
+    _source_exif: Option<HashMap<String, String>>,
+    _format: &str,
+) -> Result<(), String> {
+    // Use proper DNG export with Linear RGB layout
+    // For denoised images, we use linear RGB (not demosaiced)
+    // Use the INVERSE of sRGB-to-XYZ matrix (XYZ-to-sRGB) because the image is already in sRGB
+    let color_matrix_1 = [
+        [3.2406, -1.5372, -0.4986],
+        [-0.9689, 1.8758, 0.0415],
+        [0.0557, -0.2040, 1.0570],
+    ];
+    
+    // Neutral white balance (1.0, 1.0, 1.0) for already-processed RGB
+    let as_shot_neutral = [1.0, 1.0, 1.0];
+    
+    // For both dng-linear and dng-cfa, we export as linear RGB since the image
+    // is already denoised and processed (not raw Bayer data)
+    crate::dng_export::save_dng(
+        image,
+        path,
+        "linear",  // Always use linear RGB for denoised images
+       //"rggb",
+        color_matrix_1,
+        None,  // No separate forward matrix needed for linear RGB
+        as_shot_neutral,
+    )
+    .map_err(|e| format!("Failed to save DNG: {}", e))?;
+    
+    Ok(())
+}
+
 struct ProgressReporter<'a> {
     counter: &'a Arc<AtomicUsize>,
     total_work: usize,
     app_handle: &'a AppHandle,
 }
+
 
 const BLOCK_SIZE: usize = 8;
 const BLOCK_AREA: usize = 64;
@@ -129,6 +166,12 @@ pub async fn batch_denoise_images(
         ai_session = Some(session);
     }
 
+    let app_handle_clone = app_handle.clone();
+    let export_format = load_settings(app_handle_clone)
+        .ok()
+        .and_then(|s| s.denoise_export_format)
+        .unwrap_or_else(|| "tiff".to_string());
+
     tokio::task::spawn_blocking(move || {
         let mut results = Vec::new();
 
@@ -162,20 +205,43 @@ pub async fn batch_denoise_images(
                         .unwrap_or_default()
                         .to_string_lossy();
 
-                    let (output_filename, image_to_save) = if is_raw {
-                        (
-                            format!("{}_Denoised.tiff", stem),
-                            DynamicImage::ImageRgb16(image.to_rgb16()),
-                        )
+                    let (output_filename, save_result) = if is_raw {
+                        let filename = if export_format.starts_with("dng") {
+                            format!("{}_Denoised.dng", stem)
+                        } else {
+                            format!("{}_Denoised.tiff", stem)
+                        };
+                        
+                        let rgb16_image = image.to_rgb16();
+                        let save_result = if export_format.starts_with("dng") {
+                            // Extract EXIF from source file
+                            let source_exif = if let Ok(bytes) = fs::read(&source_path) {
+                                crate::exif_processing::read_exif_data_from_bytes(&real_path, &bytes)
+                            } else {
+                                HashMap::new()
+                            };
+                            let source_exif = if source_exif.is_empty() {
+                                None
+                            } else {
+                                Some(source_exif)
+                            };
+                            save_denoised_as_dng(&rgb16_image, &parent_dir.join(&filename), source_exif, &export_format)
+                        } else {
+                            DynamicImage::ImageRgb16(rgb16_image)
+                                .save(&parent_dir.join(&filename))
+                                .map_err(|e| e.to_string())
+                        };
+                        (filename, save_result)
                     } else {
-                        (
-                            format!("{}_Denoised.png", stem),
-                            DynamicImage::ImageRgb8(image.to_rgb8()),
-                        )
+                        let filename = format!("{}_Denoised.png", stem);
+                        let save_result = DynamicImage::ImageRgb8(image.to_rgb8())
+                            .save(&parent_dir.join(&filename))
+                            .map_err(|e| e.to_string());
+                        (filename, save_result)
                     };
 
-                    let output_path = parent_dir.join(output_filename);
-                    if let Err(e) = image_to_save.save(&output_path) {
+                    let output_path = parent_dir.join(&output_filename);
+                    if let Err(e) = save_result {
                         let _ = app_handle.emit(
                             "denoise-error",
                             format!("Failed to save {}: {}", real_path, e),
@@ -215,6 +281,7 @@ pub async fn batch_denoise_images(
 #[tauri::command]
 pub async fn save_denoised_image(
     original_path_str: String,
+    app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
     let denoised_image = state.denoise_result.lock().unwrap().take().ok_or_else(|| {
@@ -234,37 +301,78 @@ pub async fn save_denoised_image(
         .and_then(|s| s.to_str())
         .unwrap_or("denoised");
 
-    let (output_filename, image_to_save): (String, DynamicImage) = if is_raw {
-        let filename = format!("{}_Denoised.tiff", stem);
-        (
-            filename,
-            DynamicImage::ImageRgb16(denoised_image.to_rgb16()),
-        )
+    let export_format = load_settings(app_handle.clone())
+        .ok()
+        .and_then(|s| s.denoise_export_format)
+        .unwrap_or_else(|| "tiff".to_string());
+
+    if is_raw {
+        let filename = if export_format.starts_with("dng") {
+            format!("{}_Denoised.dng", stem)
+        } else {
+            format!("{}_Denoised.tiff", stem)
+        };
+        
+        let output_path = parent_dir.join(&filename);
+        let rgb16_image = denoised_image.to_rgb16();
+        
+        if export_format.starts_with("dng") {
+            // Extract EXIF from source file
+            let source_exif = if let Ok(bytes) = fs::read(&first_path) {
+                crate::exif_processing::read_exif_data_from_bytes(&original_path_str, &bytes)
+            } else {
+                HashMap::new()
+            };
+            let source_exif = if source_exif.is_empty() {
+                None
+            } else {
+                Some(source_exif)
+            };
+            save_denoised_as_dng(&rgb16_image, &output_path, source_exif, &export_format)
+                .map_err(|e| format!("Failed to save DNG: {}", e))?;
+        } else {
+            DynamicImage::ImageRgb16(rgb16_image)
+                .save(&output_path)
+                .map_err(|e| format!("Failed to save image: {}", e))?;
+        }
+
+        let (real_path, _) = crate::file_management::parse_virtual_path(&original_path_str);
+        let _ =
+            crate::exif_processing::write_rrexif_sidecar(&real_path.to_string_lossy(), &output_path);
+
+        if source_sidecar_path.exists()
+            && let Some(output_path_str) = output_path.to_str()
+        {
+            let (_, dest_sidecar_path) = crate::file_management::parse_virtual_path(output_path_str);
+            if let Err(e) = std::fs::copy(&source_sidecar_path, &dest_sidecar_path) {
+                log::warn!("Failed to copy sidecar file for denoised image: {}", e);
+            }
+        }
+
+        Ok(output_path.to_string_lossy().to_string())
     } else {
         let filename = format!("{}_Denoised.png", stem);
-        (filename, DynamicImage::ImageRgb8(denoised_image.to_rgb8()))
-    };
+        let output_path = parent_dir.join(&filename);
 
-    let output_path = parent_dir.join(output_filename);
+        DynamicImage::ImageRgb8(denoised_image.to_rgb8())
+            .save(&output_path)
+            .map_err(|e| format!("Failed to save image: {}", e))?;
 
-    image_to_save
-        .save(&output_path)
-        .map_err(|e| format!("Failed to save image: {}", e))?;
+        let (real_path, _) = crate::file_management::parse_virtual_path(&original_path_str);
+        let _ =
+            crate::exif_processing::write_rrexif_sidecar(&real_path.to_string_lossy(), &output_path);
 
-    let (real_path, _) = crate::file_management::parse_virtual_path(&original_path_str);
-    let _ =
-        crate::exif_processing::write_rrexif_sidecar(&real_path.to_string_lossy(), &output_path);
-
-    if source_sidecar_path.exists()
-        && let Some(output_path_str) = output_path.to_str()
-    {
-        let (_, dest_sidecar_path) = crate::file_management::parse_virtual_path(output_path_str);
-        if let Err(e) = std::fs::copy(&source_sidecar_path, &dest_sidecar_path) {
-            log::warn!("Failed to copy sidecar file for denoised image: {}", e);
+        if source_sidecar_path.exists()
+            && let Some(output_path_str) = output_path.to_str()
+        {
+            let (_, dest_sidecar_path) = crate::file_management::parse_virtual_path(output_path_str);
+            if let Err(e) = std::fs::copy(&source_sidecar_path, &dest_sidecar_path) {
+                log::warn!("Failed to copy sidecar file for denoised image: {}", e);
+            }
         }
-    }
 
-    Ok(output_path.to_string_lossy().to_string())
+        Ok(output_path.to_string_lossy().to_string())
+    }
 }
 
 fn run_bm3d(

@@ -559,6 +559,7 @@ export default function SettingsPanel({
     rawPreprocessingColorNr: appSettings?.rawPreprocessingColorNr ?? 0.5,
     rawPreprocessingSharpening: appSettings?.rawPreprocessingSharpening ?? 0.35,
     applyPreprocessingToNonRaws: appSettings?.applyPreprocessingToNonRaws ?? false,
+    denoiseExportFormat: appSettings?.denoiseExportFormat || 'tiff',
   });
   const [restartRequired, setRestartRequired] = useState(false);
   const [activeCategory, setActiveCategory] = useState('general');
@@ -618,6 +619,15 @@ export default function SettingsPanel({
     [t],
   );
 
+  const denoiseExportFormatOptions = useMemo<OptionItem<string>[]>(
+    () => [
+      { value: 'tiff', label: 'TIFF (16-bit)' },
+      { value: 'dng-linear', label: 'DNG (Linear RGB)' },
+      { value: 'dng-cfa', label: 'DNG (CFA - Demosaiced)' },
+    ],
+    [],
+  );
+
   const fontOptions = useMemo<OptionItem<string>[]>(
     () => [
       { value: 'poppins', label: t('settings.general.poppins') },
@@ -667,6 +677,7 @@ export default function SettingsPanel({
       rawPreprocessingColorNr: appSettings?.rawPreprocessingColorNr ?? 0.5,
       rawPreprocessingSharpening: appSettings?.rawPreprocessingSharpening ?? 0.35,
       applyPreprocessingToNonRaws: appSettings?.applyPreprocessingToNonRaws ?? false,
+      denoiseExportFormat: appSettings?.denoiseExportFormat || 'tiff',
     });
     setRestartRequired(false);
   }, [appSettings]);
@@ -2052,6 +2063,18 @@ export default function SettingsPanel({
                           />
                         </SettingItem>
                       )}
+
+                      <SettingItem
+                        label="Denoise Export Format"
+                        description="Choose the export format for denoised images"
+                      >
+                        <Dropdown
+                          onChange={(value: any) => handleProcessingSettingChange('denoiseExportFormat', value)}
+                          options={denoiseExportFormatOptions}
+                          value={processingSettings.denoiseExportFormat}
+                          triggerClassName="bg-bg-primary"
+                        />
+                      </SettingItem>
 
                       {restartRequired && (
                         <>
