@@ -6,7 +6,7 @@ use crate::image_loader::load_base_image_from_bytes;
 use crate::image_processing::apply_cpu_default_raw_processing;
 use base64::{Engine as _, engine::general_purpose};
 use image::{DynamicImage, GenericImageView, ImageFormat, Rgb, Rgb32FImage};
-use rayon::{prelude::*};
+use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
@@ -23,31 +23,60 @@ fn save_denoised_as_dng(
     _source_exif: Option<HashMap<String, String>>,
     _format: &str,
 ) -> Result<(), String> {
-    // Use proper DNG export with Linear RGB layout
-    // For denoised images, we use linear RGB (not demosaiced)
-    // Use the INVERSE of sRGB-to-XYZ matrix (XYZ-to-sRGB) because the image is already in sRGB
+    // apply_cpu_default_raw_processing encoded the image with gamma=1/2.38 and
+    // contrast=1.28. DNG PhotometricInterpretation=LinearRaw (34892) requires
+    // truly linear (no-gamma) values, so we reverse that encoding here.
+    const GAMMA: f32 = 2.38;
+    const CONTRAST: f32 = 1.28;
+
+    let linear_pixels: Vec<u16> = image
+        .as_raw()
+        .par_iter()
+        .map(|&v| {
+            let f = v as f32 / 65535.0;
+            // Reverse contrast: (x - 0.5) / CONTRAST + 0.5
+            let gamma_val = ((f - 0.5) / CONTRAST + 0.5).clamp(0.0, 1.0);
+            // Reverse gamma: was linear^(1/GAMMA), so inverse is gamma_val^GAMMA
+            let linear = gamma_val.powf(GAMMA);
+            (linear.clamp(0.0, 1.0) * 65535.0).round() as u16
+        })
+        .collect();
+
+    let linear_image = image::ImageBuffer::<Rgb<u16>, Vec<u16>>::from_raw(
+        image.width(),
+        image.height(),
+        linear_pixels,
+    )
+    .ok_or("Failed to create linearized image buffer")?;
+
+    // DNG spec: ColorMatrix1 maps XYZ (D50) → camera-native color space.
+    // Our "camera native" is linear sRGB; use the D50-adapted XYZ→sRGB matrix.
+    // The previously used D65-based matrix is incorrect per the DNG specification.
     let color_matrix_1 = [
-        [3.2406, -1.5372, -0.4986],
-        [-0.9689, 1.8758, 0.0415],
-        [0.0557, -0.2040, 1.0570],
+        [ 3.1338561, -1.6168667, -0.4906146],
+        [-0.9787684,  1.9161415,  0.0334540],
+        [ 0.0719453, -0.2289914,  1.4052427],
     ];
-    
-    // Neutral white balance (1.0, 1.0, 1.0) for already-processed RGB
+
+    // Image is already white-balanced (fully processed before gamma was applied).
     let as_shot_neutral = [1.0, 1.0, 1.0];
-    
-    // For both dng-linear and dng-cfa, we export as linear RGB since the image
-    // is already denoised and processed (not raw Bayer data)
+
+    let cfa_type = if _format=="dng-cfa" {
+        "rggb"
+    } else {
+        "linear"
+    };
+
     crate::dng_export::save_dng(
-        image,
+        &linear_image,
         path,
-        "linear",  // Always use linear RGB for denoised images
-       //"rggb",
+        cfa_type,
         color_matrix_1,
-        None,  // No separate forward matrix needed for linear RGB
+        None,
         as_shot_neutral,
     )
     .map_err(|e| format!("Failed to save DNG: {}", e))?;
-    
+
     Ok(())
 }
 
@@ -90,7 +119,6 @@ pub async fn apply_denoising(
     path: String,
     intensity: f32,
     method: String,
-    denoise_model: String,
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
@@ -98,9 +126,9 @@ pub async fn apply_denoising(
     let path_str = source_path.to_string_lossy().to_string();
 
     let mut ai_session = None;
-    if method == "ai" {
-        let session = if denoise_model == "model2" {
-            crate::ai_processing::get_or_init_denoise_model_2(
+    if method.starts_with("ai") {
+        let session = if method == "ai_rr" {
+            crate::ai_processing::get_or_init_denoise_model_rr(
                 &app_handle,
                 &state.ai_state,
                 &state.ai_init_lock,
@@ -108,7 +136,7 @@ pub async fn apply_denoising(
             .await
             .map_err(|e| e.to_string())?
         } else {
-            crate::ai_processing::get_or_init_denoise_model(
+            crate::ai_processing::get_or_init_denoise_model_nind(
                 &app_handle,
                 &state.ai_state,
                 &state.ai_init_lock,
@@ -122,7 +150,7 @@ pub async fn apply_denoising(
     let denoise_result_handle = state.denoise_result.clone();
 
     tokio::task::spawn_blocking(move || {
-        match denoise_image(path_str, intensity, method, app_handle.clone(), ai_session, denoise_model) {
+        match denoise_image(path_str, intensity, method, app_handle.clone(), ai_session) {
             Ok((image, _)) => {
                 *denoise_result_handle.lock().unwrap() = Some(image);
             }
@@ -140,14 +168,13 @@ pub async fn batch_denoise_images(
     paths: Vec<String>,
     intensity: f32,
     method: String,
-    denoise_model: String,
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<String>, String> {
     let mut ai_session = None;
-    if method == "ai" {
-        let session = if denoise_model == "model2" {
-            crate::ai_processing::get_or_init_denoise_model_2(
+    if method.starts_with("ai") {
+        let session = if method == "ai_rr" {
+            crate::ai_processing::get_or_init_denoise_model_rr(
                 &app_handle,
                 &state.ai_state,
                 &state.ai_init_lock,
@@ -155,7 +182,7 @@ pub async fn batch_denoise_images(
             .await
             .map_err(|e| e.to_string())?
         } else {
-            crate::ai_processing::get_or_init_denoise_model(
+            crate::ai_processing::get_or_init_denoise_model_nind(
                 &app_handle,
                 &state.ai_state,
                 &state.ai_init_lock,
@@ -195,7 +222,6 @@ pub async fn batch_denoise_images(
                 method.clone(),
                 app_handle.clone(),
                 ai_session.clone(),
-                denoise_model.clone(),
             ) {
                 Ok((image, _)) => {
                     let is_raw = crate::formats::is_raw_file(&real_path);
@@ -306,6 +332,7 @@ pub async fn save_denoised_image(
         .and_then(|s| s.denoise_export_format)
         .unwrap_or_else(|| "tiff".to_string());
 
+    log::info!("Denoise export format: {}", export_format);
     if is_raw {
         let filename = if export_format.starts_with("dng") {
             format!("{}_Denoised.dng", stem)
@@ -431,7 +458,6 @@ fn denoise_image(
     method: String,
     app_handle: AppHandle,
     ai_session: Option<Arc<Mutex<ort::session::Session>>>,
-    denoise_model: String,
 ) -> Result<(DynamicImage, String), String> {
     let path = Path::new(&path_str);
     if !path.exists() {
@@ -444,21 +470,35 @@ fn denoise_image(
     let _ = app_handle.emit("denoise-progress", "Loading image...");
 
     let file_bytes = fs::read(path).map_err(|e| e.to_string())?;
-    let dynamic_img = load_base_image_from_bytes(&file_bytes, &path_str, false, &settings, None)
-        .map_err(|e| e.to_string())?;
+
+    let mut original_settings = settings.clone();
+    if method == "raw9" {
+        original_settings.use_apple_raw9 = Some(false);
+    }
+
+    let dynamic_img =
+        load_base_image_from_bytes(&file_bytes, &path_str, false, &original_settings, None)
+            .map_err(|e| e.to_string())?;
 
     let rgb_img_for_denoiser = dynamic_img.to_rgb32f();
 
-    let mut out_dynamic = if method == "ai" {
+    let mut out_dynamic = if method.starts_with("ai") {
         let session_arc = ai_session.ok_or_else(|| "AI Session not provided".to_string())?;
         crate::ai_processing::run_ai_denoise(
             &rgb_img_for_denoiser,
             intensity,
             &session_arc,
             &app_handle,
-            &denoise_model,
+            &method,
         )
         .map_err(|e| e.to_string())?
+    } else if method == "raw9" {
+        if !is_raw {
+            return Err("Apple RAW 9 denoising only works on RAW files.".to_string());
+        }
+        let _ = app_handle.emit("denoise-progress", "Developing with Apple RAW 9...");
+        crate::apple_raw::denoise_raw9(&file_bytes, &path_str, intensity)
+            .map_err(|e| e.to_string())?
     } else {
         run_bm3d(&rgb_img_for_denoiser, intensity, &app_handle)?
     };

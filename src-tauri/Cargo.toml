@@ -33,7 +33,7 @@ tokio = { version = "1", features = ["full"] }
 uuid = { version = "1.25", features = ["v4", "serde"] }
 walkdir = "2.5.0"
 imageproc = "0.27.0"
-ort = { version = "2.0.0-rc.13", features = ["ndarray", "cuda", "directml", "fetch-models"] }
+ort = { version = "2.0.0-rc.13", features = ["ndarray", "cuda", "directml", "fetch-models", "lax-feature-matching"] }
 ndarray = "0.17"
 tauri-plugin-process = "2.3.1"
 tauri-plugin-os = "2.3.2"
@@ -79,6 +79,23 @@ gphoto2 = { git = "https://github.com/CyberTimon/libgphoto2-rs", optional = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3.2", features = [
+    "NSData",
+    "NSDictionary",
+    "NSString",
+    "NSURL",
+    "NSValue",
+    "NSArray",
+] }
+objc2-core-foundation = { version = "0.3.2", features = ["CFCGTypes"] }
+objc2-core-graphics = { version = "0.3.2", features = ["CGColorSpace"] }
+objc2-core-image = { version = "0.3.2", features = [
+    "CIContext",
+    "CIFilter",
+    "CIImage",
+    "CIRAWFilter",
+] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 ndk-context = "0.1"
