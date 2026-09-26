@@ -8,7 +8,6 @@ use base64::{Engine as _, engine::general_purpose};
 use image::{DynamicImage, GenericImageView, ImageFormat, Rgb, Rgb32FImage};
 use rayon::prelude::*;
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::fs;
 use std::io::Cursor;
 use std::path::Path;
@@ -16,12 +15,35 @@ use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter};
 
+fn load_dng_exif(source_path: &str) -> Option<crate::dng_export::DngExifData> {
+    let bytes = fs::read(source_path).ok()?;
+    let meta = crate::exif_processing::read_raw_metadata(&bytes)?;
+    let exif = &meta.exif;
+    let mut data = crate::dng_export::DngExifData::default();
+    if !meta.make.is_empty() { data.make = Some(meta.make.clone()); }
+    if !meta.model.is_empty() { data.model = Some(meta.model.clone()); }
+    if let Some(r) = exif.exposure_time { data.exposure_time = Some((r.n, r.d)); }
+    if let Some(r) = exif.fnumber { data.f_number = Some((r.n, r.d)); }
+    if let Some(r) = exif.focal_length { data.focal_length = Some((r.n, r.d)); }
+    if let Some(r) = exif.exposure_bias { data.exposure_bias = Some((r.n, r.d)); }
+    if let Some(v) = exif.iso_speed { data.iso = Some(v as u16); }
+    else if let Some(v) = exif.iso_speed_ratings { data.iso = Some(v); }
+    if let Some(v) = exif.flash { data.flash = Some(v); }
+    if let Some(v) = exif.metering_mode { data.metering_mode = Some(v); }
+    if let Some(v) = exif.white_balance { data.white_balance = Some(v); }
+    if let Some(v) = exif.exposure_program { data.exposure_program = Some(v); }
+    if let Some(ref s) = exif.lens_make { data.lens_make = Some(s.clone()); }
+    if let Some(ref s) = exif.lens_model { data.lens_model = Some(s.clone()); }
+    if let Some(ref s) = exif.date_time_original { data.date_time_original = Some(s.clone()); }
+    Some(data)
+}
+
 // Helper function to save 16-bit RGB image as proper DNG file
 fn save_denoised_as_dng(
     image: &image::ImageBuffer<Rgb<u16>, Vec<u16>>,
     path: &Path,
-    _source_exif: Option<HashMap<String, String>>,
-    _format: &str,
+    source_path: &str,
+    format: &str,
 ) -> Result<(), String> {
     // apply_cpu_default_raw_processing encoded the image with gamma=1/2.38 and
     // contrast=1.28. DNG PhotometricInterpretation=LinearRaw (34892) requires
@@ -61,11 +83,9 @@ fn save_denoised_as_dng(
     // Image is already white-balanced (fully processed before gamma was applied).
     let as_shot_neutral = [1.0, 1.0, 1.0];
 
-    let cfa_type = if _format=="dng-cfa" {
-        "rggb"
-    } else {
-        "linear"
-    };
+    let cfa_type = if format == "dng-cfa" { "rggb" } else { "linear" };
+
+    let dng_exif = if !source_path.is_empty() { load_dng_exif(source_path) } else { None };
 
     crate::dng_export::save_dng(
         &linear_image,
@@ -74,6 +94,7 @@ fn save_denoised_as_dng(
         color_matrix_1,
         None,
         as_shot_neutral,
+        dng_exif.as_ref(),
     )
     .map_err(|e| format!("Failed to save DNG: {}", e))?;
 
@@ -240,18 +261,7 @@ pub async fn batch_denoise_images(
                         
                         let rgb16_image = image.to_rgb16();
                         let save_result = if export_format.starts_with("dng") {
-                            // Extract EXIF from source file
-                            let source_exif = if let Ok(bytes) = fs::read(&source_path) {
-                                crate::exif_processing::read_exif_data_from_bytes(&real_path, &bytes)
-                            } else {
-                                HashMap::new()
-                            };
-                            let source_exif = if source_exif.is_empty() {
-                                None
-                            } else {
-                                Some(source_exif)
-                            };
-                            save_denoised_as_dng(&rgb16_image, &parent_dir.join(&filename), source_exif, &export_format)
+                            save_denoised_as_dng(&rgb16_image, &parent_dir.join(&filename), &real_path, &export_format)
                         } else {
                             DynamicImage::ImageRgb16(rgb16_image)
                                 .save(&parent_dir.join(&filename))
@@ -344,18 +354,7 @@ pub async fn save_denoised_image(
         let rgb16_image = denoised_image.to_rgb16();
         
         if export_format.starts_with("dng") {
-            // Extract EXIF from source file
-            let source_exif = if let Ok(bytes) = fs::read(&first_path) {
-                crate::exif_processing::read_exif_data_from_bytes(&original_path_str, &bytes)
-            } else {
-                HashMap::new()
-            };
-            let source_exif = if source_exif.is_empty() {
-                None
-            } else {
-                Some(source_exif)
-            };
-            save_denoised_as_dng(&rgb16_image, &output_path, source_exif, &export_format)
+            save_denoised_as_dng(&rgb16_image, &output_path, &original_path_str, &export_format)
                 .map_err(|e| format!("Failed to save DNG: {}", e))?;
         } else {
             DynamicImage::ImageRgb16(rgb16_image)

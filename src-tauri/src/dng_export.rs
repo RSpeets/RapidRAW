@@ -60,6 +60,24 @@ const PHOTOMETRIC_LINEAR_RAW: u16 = 34892;
 // CalibrationIlluminant1 value for D65
 const LIGHT_SOURCE_D65: u16 = 21;
 
+const TIFF_UNDEFINED: u16 = 7;
+const TAG_EXIF_IFD_POINTER: u16 = 34665;
+
+// EXIF sub-IFD tags
+const TAG_EXIF_EXPOSURE_TIME: u16 = 33434;
+const TAG_EXIF_F_NUMBER: u16 = 33437;
+const TAG_EXIF_EXPOSURE_PROGRAM: u16 = 34850;
+const TAG_EXIF_ISO_SPEED: u16 = 34855;
+const TAG_EXIF_VERSION: u16 = 36864;
+const TAG_EXIF_DATE_TIME_ORIGINAL: u16 = 36867;
+const TAG_EXIF_EXPOSURE_BIAS: u16 = 37380;
+const TAG_EXIF_METERING_MODE: u16 = 37383;
+const TAG_EXIF_FLASH: u16 = 37385;
+const TAG_EXIF_FOCAL_LENGTH: u16 = 37386;
+const TAG_EXIF_WHITE_BALANCE: u16 = 41987;
+const TAG_EXIF_LENS_MAKE: u16 = 42035;
+const TAG_EXIF_LENS_MODEL: u16 = 42036;
+
 #[derive(Clone, Debug)]
 struct IfdEntry {
     tag: u16,
@@ -186,6 +204,68 @@ impl DngLayout {
     fn is_linear(&self) -> bool {
         matches!(self, Self::Linear)
     }
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct DngExifData {
+    pub make: Option<String>,
+    pub model: Option<String>,
+    pub lens_make: Option<String>,
+    pub lens_model: Option<String>,
+    pub date_time_original: Option<String>,
+    pub exposure_time: Option<(u32, u32)>,
+    pub f_number: Option<(u32, u32)>,
+    pub iso: Option<u16>,
+    pub focal_length: Option<(u32, u32)>,
+    pub exposure_bias: Option<(i32, i32)>,
+    pub flash: Option<u16>,
+    pub metering_mode: Option<u16>,
+    pub white_balance: Option<u16>,
+    pub exposure_program: Option<u16>,
+}
+
+fn build_exif_ifd_entries(exif: &DngExifData) -> Vec<IfdEntry> {
+    let mut entries = vec![
+        IfdEntry::new(TAG_EXIF_VERSION, TIFF_UNDEFINED, 4, b"0231".to_vec()),
+    ];
+    if let Some((n, d)) = exif.exposure_time {
+        entries.push(IfdEntry::rational(TAG_EXIF_EXPOSURE_TIME, &[(n, d)]));
+    }
+    if let Some((n, d)) = exif.f_number {
+        entries.push(IfdEntry::rational(TAG_EXIF_F_NUMBER, &[(n, d)]));
+    }
+    if let Some(v) = exif.exposure_program {
+        entries.push(IfdEntry::short(TAG_EXIF_EXPOSURE_PROGRAM, &[v]));
+    }
+    if let Some(v) = exif.iso {
+        entries.push(IfdEntry::short(TAG_EXIF_ISO_SPEED, &[v]));
+    }
+    if let Some(ref dt) = exif.date_time_original {
+        entries.push(IfdEntry::ascii(TAG_EXIF_DATE_TIME_ORIGINAL, dt));
+    }
+    if let Some((n, d)) = exif.exposure_bias {
+        entries.push(IfdEntry::srational(TAG_EXIF_EXPOSURE_BIAS, &[(n, d)]));
+    }
+    if let Some(v) = exif.metering_mode {
+        entries.push(IfdEntry::short(TAG_EXIF_METERING_MODE, &[v]));
+    }
+    if let Some(v) = exif.flash {
+        entries.push(IfdEntry::short(TAG_EXIF_FLASH, &[v]));
+    }
+    if let Some((n, d)) = exif.focal_length {
+        entries.push(IfdEntry::rational(TAG_EXIF_FOCAL_LENGTH, &[(n, d)]));
+    }
+    if let Some(v) = exif.white_balance {
+        entries.push(IfdEntry::short(TAG_EXIF_WHITE_BALANCE, &[v]));
+    }
+    if let Some(ref s) = exif.lens_make {
+        entries.push(IfdEntry::ascii(TAG_EXIF_LENS_MAKE, s));
+    }
+    if let Some(ref s) = exif.lens_model {
+        entries.push(IfdEntry::ascii(TAG_EXIF_LENS_MODEL, s));
+    }
+    entries.sort_by_key(|e| e.tag);
+    entries
 }
 
 const XTRANS_PATTERN: [[u8; 6]; 6] = [
@@ -342,6 +422,7 @@ pub fn save_dng<P: AsRef<Path>>(
     color_matrix_1: [[f64; 3]; 3],
     forward_matrix_1: Option<[[f64; 3]; 3]>,
     as_shot_neutral: [f64; 3],
+    exif: Option<&DngExifData>,
 ) -> io::Result<()> {
     if image.width() == 0 || image.height() == 0 {
         return Err(io::Error::new(
@@ -555,6 +636,23 @@ pub fn save_dng<P: AsRef<Path>>(
         }
     }
 
+    // Populate camera identity and add EXIF sub-IFD pointer when EXIF data is available.
+    if let Some(exif_data) = exif {
+        if let Some(ref make) = exif_data.make {
+            for entry in &mut entries {
+                if entry.tag == TAG_MAKE { *entry = IfdEntry::ascii(TAG_MAKE, make); break; }
+            }
+        }
+        if let Some(ref model) = exif_data.model {
+            for entry in &mut entries {
+                if entry.tag == TAG_MODEL { *entry = IfdEntry::ascii(TAG_MODEL, model); }
+                if entry.tag == TAG_UNIQUE_CAMERA_MODEL { *entry = IfdEntry::ascii(TAG_UNIQUE_CAMERA_MODEL, model); }
+            }
+        }
+        // Placeholder; real offset filled in after layout calculation.
+        entries.push(IfdEntry::long(TAG_EXIF_IFD_POINTER, &[0]));
+    }
+
     entries.sort_by_key(|entry| entry.tag);
 
     let entry_count = entries.len();
@@ -602,7 +700,38 @@ pub fn save_dng<P: AsRef<Path>>(
         }
     }
 
-    let strip_offset = align_even(external_data_offset);
+    // Build EXIF sub-IFD layout (if any) and compute all offsets.
+    let exif_entries = exif.map(build_exif_ifd_entries);
+    let (exif_ifd_offset, exif_data_offsets, strip_offset) = match &exif_entries {
+        Some(exif_ents) => {
+            let exif_entry_count = exif_ents.len() as u32;
+            let exif_ifd_off = align_even(external_data_offset);
+            let exif_ifd_sz = 2u32 + (exif_entry_count * 12) + 4;
+            let mut exif_ext_off = align_even(exif_ifd_off + exif_ifd_sz);
+            let mut offsets = vec![0u32; exif_ents.len()];
+            for (i, entry) in exif_ents.iter().enumerate() {
+                if entry.data.len() > 4 {
+                    offsets[i] = exif_ext_off;
+                    exif_ext_off = align_even(
+                        exif_ext_off
+                            .checked_add(entry.data.len() as u32)
+                            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "DNG-offset overflow."))?,
+                    );
+                }
+            }
+            (Some(exif_ifd_off), Some(offsets), align_even(exif_ext_off))
+        }
+        None => (None, None, align_even(external_data_offset)),
+    };
+
+    if let Some(exif_off) = exif_ifd_offset {
+        for entry in &mut entries {
+            if entry.tag == TAG_EXIF_IFD_POINTER {
+                *entry = IfdEntry::long(TAG_EXIF_IFD_POINTER, &[exif_off]);
+                break;
+            }
+        }
+    }
 
     for entry in &mut entries {
         if entry.tag == TAG_STRIP_OFFSETS {
@@ -647,6 +776,24 @@ pub fn save_dng<P: AsRef<Path>>(
 
         if entry.data.len() % 2 != 0 {
             file.write_all(&[0])?;
+        }
+    }
+
+    // Write EXIF sub-IFD and its external data.
+    if let (Some(exif_ents), Some(exif_off), Some(exif_offs)) =
+        (&exif_entries, exif_ifd_offset, &exif_data_offsets)
+    {
+        file.seek(SeekFrom::Start(exif_off as u64))?;
+        file.write_all(&(exif_ents.len() as u16).to_le_bytes())?;
+        for (i, entry) in exif_ents.iter().enumerate() {
+            write_ifd_entry(&mut file, entry, exif_offs[i])?;
+        }
+        file.write_all(&0u32.to_le_bytes())?;
+        for (i, entry) in exif_ents.iter().enumerate() {
+            if entry.data.len() <= 4 { continue; }
+            file.seek(SeekFrom::Start(exif_offs[i] as u64))?;
+            file.write_all(&entry.data)?;
+            if entry.data.len() % 2 != 0 { file.write_all(&[0])?; }
         }
     }
 
@@ -712,6 +859,7 @@ fn main() -> io::Result<()> {
         color_matrix_1,
         forward_matrix_1,
         as_shot_neutral,
+        None,
     )?;
 
     // Gesimuleerde Bayer RGGB-DNG:
@@ -722,6 +870,7 @@ fn main() -> io::Result<()> {
         color_matrix_1,
         forward_matrix_1,
         as_shot_neutral,
+        None,
     )?;
 
     // Gesimuleerde X-Trans-DNG:
@@ -732,6 +881,7 @@ fn main() -> io::Result<()> {
         color_matrix_1,
         forward_matrix_1,
         as_shot_neutral,
+        None,
     )?;
 
     println!("DNG-bestanden geschreven.");
