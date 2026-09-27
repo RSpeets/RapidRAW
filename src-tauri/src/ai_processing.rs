@@ -51,9 +51,9 @@ const DENOISE_URL: &str = "https://huggingface.co/CyberTimon/RapidRAW-Models/res
 const DENOISE_FILENAME: &str = "nind_denoise_utnet_684.onnx";
 const DENOISE_SHA256: &str = "ee3586279d514df557ff3f7dec6df37fafc51ba5d3a3435b2cc9ac2d9017e7fe";
 
-const RAWREFINERY_URL: &str = "https://speets.eu/download/ShadowWeightedL1_24_deep_500_32.onnx";
-const RAWREFINERY_FILENAME: &str = "ShadowWeightedL1_24_deep_500_32.onnx";
-const RAWREFINERY_SHA256: &str = "959b44a7c1f64485263f5ad8eab362d0d9caf97a67a8e6c2e78df5ae1a6e598a";
+const RAWREFINERY_URL: &str = "https://speets.eu/download/ShadowWeightedL1_24_deep_500_32_256.onnx";
+const RAWREFINERY_FILENAME: &str = "ShadowWeightedL1_24_deep_500_32_256.onnx";
+const RAWREFINERY_SHA256: &str = "b009ca72cf524251817643bbf03dfb08fba5347a448f3e886dd589d57bb3d667";
 
 const LAMA_URL: &str =
     "https://huggingface.co/CyberTimon/RapidRAW-Models/resolve/main/lama_fp16.onnx?download=true";
@@ -1033,6 +1033,7 @@ impl TileParams {
 const TILE_BALANCED: TileParams = TileParams::new(504, 480, 6);
 const TILE_FASTER: TileParams = TileParams::new(504, 504, 0);
 const TILE_HIGHER_QUALITY: TileParams = TileParams::new(504, 448, 12);
+const TILE_RAWREFINARY: TileParams = TileParams::new(256, 248, 3);
 
 fn select_tile_params(quality_0_1: f32) -> TileParams {
     let q = quality_0_1.clamp(0.0, 1.0);
@@ -1150,7 +1151,11 @@ fn run_native_denoise(
 ) -> Result<()> {
     let w = width as i32;
     let h = height as i32;
-    let params = select_tile_params(intensity);
+    let params = if method == "ai_rr" {
+        TILE_RAWREFINARY
+    } else {
+        select_tile_params(intensity)
+    };
     let step = params.ucs.saturating_sub(params.overlap).max(1);
     let iperhl = (width.saturating_sub(params.ucs) as f64 / step as f64).ceil() as usize;
     let ipervl = (height.saturating_sub(params.ucs) as f64 / step as f64).ceil() as usize;
@@ -1176,7 +1181,7 @@ fn run_native_denoise(
         // Tensor::from_array (owned) can be misidentified as already on-device, giving zeros.
 
         let mut cond = Array::<f32, _>::zeros((1, 1));
-        cond[[0, 0]] = 10.; // This value needs to be set based on the ISO number, 10 works for now (see RawRefinery documentation).
+        cond[[0, 0]] = 5.0 + 10.0 * intensity;
 
         let out = {
             let mut sess = session.lock().unwrap();
